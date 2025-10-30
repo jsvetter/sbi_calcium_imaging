@@ -1,7 +1,9 @@
-# %%
 import numpy as np
 import torch
 from torch import Tensor
+from sbi.utils import BoxUniform
+
+# NOTE: mainly taken from Peter's repo, slighly adapted to support many different spike trains at once
 
 
 def bi_exp_kernel_torch(t: Tensor, tau_rise: Tensor, tau_decay: Tensor) -> Tensor:
@@ -59,7 +61,6 @@ class BatchedSimulator:
 
     def __init__(
         self,
-        spike_train: np.ndarray,
         dt: float,
         device: str = "cpu",
         nonlinearity: str = "hill",
@@ -69,7 +70,6 @@ class BatchedSimulator:
         self.dt = dt
         self.device = device
         self.nonlinearity = nonlinearity
-        self.T = len(spike_train)
 
         # Pre-compute kernel time base (long enough for largest tau_decay)
         self.kT = int(np.ceil(5.0 * max_tau_decay / dt))
@@ -102,12 +102,12 @@ class BatchedSimulator:
         # Convolve spike train with each kernel using FFT (fastest for long signals)
         # spike_train is [T], h is [N, kT]
         # Pad to avoid circular convolution artifacts
-        conv_len = self.T + self.kT - 1
+        T = spike_train.shape[1]
+        conv_len = T + self.kT - 1
         fft_len = 2 ** int(np.ceil(np.log2(conv_len)))  # Next power of 2 for efficiency
 
         # FFT of spike train [fft_len]
         spike_fft = torch.fft.rfft(spike_train, n=fft_len)
-        print(spike_fft.shape)
 
         # FFT of kernels [N, fft_len//2 + 1]
         h_padded = torch.nn.functional.pad(h, (0, fft_len - self.kT))
@@ -118,7 +118,7 @@ class BatchedSimulator:
         c_full = torch.fft.irfft(c_fft, n=fft_len)
 
         # Extract valid portion [N, T]
-        c = c_full[:, : self.T]
+        c = c_full[:, :T]
 
         # Apply nonlinearity
         if self.nonlinearity == "hill":
@@ -139,73 +139,32 @@ class BatchedSimulator:
 
         return F
 
-
-# %%
-if __name__ == "__main__":
-    from sbi_calcium_imaging.spike_train_utils import (
-        load_ground_truth_mat,
-        make_spike_train,
-    )
-    import matplotlib.pyplot as plt
-    from sbi.utils import BoxUniform
-
-    # Load example data
-    fluo_time, fluo_mean, ap_times_s = load_ground_truth_mat(
-        mat_path="/Users/juli/Desktop/peters_trace.mat"
-    )
-    spike_train, dt = make_spike_train(fluo_time, ap_times_s)
-
-    plt.plot(spike_train)
-    plt.show()
-
-    test_simu = BatchedSimulator(spike_train, dt, device="cpu")
-
-    def build_sbi_prior_focused(
-        device: str = "cpu",
-        tau_rise_range=(0.005, 0.008),
-        tau_decay_range=(0.2, 1.0),
-        amp_range=(5.0, 30.0),
-    ):
+    def get_default_prior(self):
         """Build tighter priors if you have good starting points."""
         low = torch.tensor(
             [
-                tau_rise_range[0],  # tau_rise
-                tau_decay_range[0],  # tau_decay
-                amp_range[0],  # amp
+                0.005,  # tau_rise
+                0.2,  # tau_decay
+                5.0,  # amp
                 5.0,  # kd
                 1.0,  # n
                 -0.1,  # f0
                 0.03,  # sigma
             ],
-            device=device,
+            device=self.device,
         )
 
         high = torch.tensor(
             [
-                tau_rise_range[1],  # tau_rise
-                tau_decay_range[1],  # tau_decay
-                amp_range[1],  # amp
+                0.008,  # tau_rise
+                1.0,  # tau_decay
+                30.0,  # amp
                 20.0,  # kd
                 2.0,  # n
                 0.1,  # f0
                 0.3,  # sigma
             ],
-            device=device,
+            device=self.device,
         )
 
         return BoxUniform(low=low, high=high)
-
-    prior = build_sbi_prior_focused(device="cpu")
-    theta_samples = prior.sample((1,))
-
-    poison_spikes = torch.poisson(torch.ones(1, 19500) * 0.02)
-    with torch.no_grad():
-        F_samples = test_simu(
-            theta_samples,
-            # spike_train=torch.tensor(spike_train, dtype=torch.float32),
-            spike_train=poison_spikes,
-        )
-
-    plt.plot(F_samples.T)
-    plt.plot(poison_spikes.T)
-    plt.show()
